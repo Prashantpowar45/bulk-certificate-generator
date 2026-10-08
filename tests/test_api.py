@@ -1,10 +1,13 @@
 from concurrent.futures import ThreadPoolExecutor
+import os
+from sqlalchemy.engine import make_url
 from io import BytesIO
 from time import monotonic, sleep
 import pytest
+from sqlalchemy import text
 from fastapi.testclient import TestClient
 from pypdf import PdfReader
-from app.db import connect
+from app.db import connect, engine_for, metadata, normalized_url
 from app.main import create_app
 from app.worker import process_one
 import app.worker as worker
@@ -12,7 +15,10 @@ import app.worker as worker
 
 @pytest.fixture
 def setup(tmp_path):
-    database = str(tmp_path / 'test.db')
+    database = os.getenv('TEST_DATABASE_URL') or str(tmp_path / 'test.db')
+    if os.getenv('TEST_DATABASE_URL'):
+        assert make_url(normalized_url(database)).database.endswith('_test'), 'Use a dedicated *_test database'
+        metadata.drop_all(engine_for(database))
     with TestClient(create_app(database, worker_enabled=False)) as client:
         yield client, database
 
@@ -73,7 +79,7 @@ def test_invalid_envelope_returns_422_without_creating_job(setup, changes):
     data = payload() | changes
     assert client.post('/jobs', json=data).status_code == 422
     with connect(database) as conn:
-        assert conn.execute('SELECT COUNT(*) FROM jobs').fetchone()[0] == 0
+        assert conn.execute(text('SELECT COUNT(*) FROM jobs')).fetchone()[0] == 0
 
 
 @pytest.mark.parametrize('invalid', [

@@ -2,7 +2,7 @@
 
 A FastAPI backend that accepts a batch of recipients, validates each entry, generates individual PDF certificates from one fixed template, and exposes persistent progress and downloads.
 
-**Stack:** Python 3.12, FastAPI, SQLite, Pydantic, ReportLab, pytest.
+**Stack:** Python 3.12, FastAPI, SQLAlchemy, SQLite/PostgreSQL, Pydantic, ReportLab, pytest.
 
 ## Setup and run
 
@@ -96,13 +96,14 @@ A mixed batch with validation failures may immediately show `processing`; the st
 | GET | `/jobs/{job_id}` | Job metadata and progress |
 | GET | `/jobs/{job_id}/certificates` | Paginated recipient outcomes |
 | GET | `/certificates/{certificate_id}` | Download a PDF |
-| GET | `/health` | Basic API and database connectivity check |
+| GET | `/health` | API and database connectivity check |
+| POST | `/jobs/{job_id}/resume` | Process only pending entries after an interruption |
 
 Unknown IDs return **404**. Downloading a pending or failed certificate returns **409**. Invalid request-level metadata or pagination returns **422**.
 
 ## Validation and failure handling
 
-- A request must contain 1–1,000 recipients; split larger datasets into separate jobs.
+- A local request must contain 1–1,000 recipients; Vercel limits requests to 100. Split larger datasets into separate jobs.
 - `course_name`, `organization`, and each recipient `name` must contain 1–120 printable ASCII characters after trimming. This is an explicit scope of the predefined template with embedded Vera fonts, preventing missing glyphs. International text would require an embedded font and appropriate shaping support.
 - `issue_date` is a valid calendar date in `YYYY-MM-DD` format.
 - Each recipient requires a nonblank name and syntactically valid email. No email is sent and no DNS delivery check is performed. Email is metadata; the PDF displays the name, course, organization, date, and unique certificate ID.
@@ -113,17 +114,33 @@ Unknown IDs return **404**. Downloading a pending or failed certificate returns 
 
 ## Processing and storage decisions
 
-**Why background processing?** Returning 202 keeps bulk PDF generation out of the request path. HTTP requests validate and persist work; a worker polls the durable pending queue every 250 ms when idle.
+**Local / always-on server:** the API returns 202 after persisting the batch. A worker polls pending rows every 250 ms when idle. SQLite is the zero-configuration default; set `DATABASE_URL` for PostgreSQL instead. Jobs, recipient outcomes, and PDF bytes are stored transactionally in either database.
 
-**Why SQLite?** It is a relational database with foreign keys and transactions and needs no external setup for this assignment. Jobs and certificates have a one-to-many relationship. Pending work and output PDFs survive restarts.
+**Vercel:** set `VERCEL=1` (provided by Vercel) and configure a persistent PostgreSQL `DATABASE_URL`. There is no daemon worker. The POST request processes its own batch before returning 202, preserving the response schema; poll the returned status URL to inspect the result. The hosted batch cap is 100 instead of 1,000 to bound invocation work. This is an intentionally synchronous serverless mode. Requests can still time out if the database or runtime is slow; for high-volume production, use a durable external queue and worker.
 
-**Atomic generation:** the worker opens `BEGIN IMMEDIATE`, selects one pending row, renders the PDF, saves the PDF bytes and status, and commits. A crash before commit rolls everything back, leaving the entry pending for recovery. The system can render again after an interrupted attempt, but only one committed PDF exists per certificate. Multiple workers are safe because SQLite serializes writers. This deliberately holds the write lock during one small PDF render; workers do not generate in parallel. WAL mode allows status reads during generation. Database operations wait up to 10 seconds for a writer lock.
+**Atomic generation:** each PDF and its completion status commit together. SQLite uses `BEGIN IMMEDIATE` to serialize writers. PostgreSQL uses row locking with `FOR UPDATE SKIP LOCKED`, so concurrent workers cannot process the same row. A crash before commit rolls back that recipient to pending; committed output stays intact. Status reads use a consistent transaction snapshot. PDF rendering happens inside a transaction, a deliberate simplicity tradeoff; keep batches bounded.
 
-**Why store PDF bytes in the database?** For this bounded assignment, it keeps PDF output and completion status in the same atomic transaction and avoids inconsistent file paths or missing disk files. No user-provided value becomes a filesystem path. At much larger volumes, use PostgreSQL, a job queue, and object storage with explicit recovery and retry policies.
+**Recovery:** `POST /jobs/{job_id}/resume` processes pending entries of an interrupted job without regenerating completed PDFs or retrying failed entries. It is safe to call again. For Vercel, use the same database with `python -m app.worker` on an always-on host if unattended recovery is needed. A hard timeout before the creation response can leave a stored job whose ID the client did not receive; operator lookup is needed in that case. POST creation is not idempotent, so blindly resubmitting can duplicate jobs.
 
-**Progress:** computed from certificate rows rather than mutable counters, so counters cannot drift after failures or restarts. List responses omit PDF blobs and support pagination; downloads fetch only one PDF.
+**Why database PDF storage?** It keeps bytes and status atomic and avoids user-controlled filesystem paths. At large volumes, move PDFs to object storage and add an explicit recovery protocol.
 
-**Scope:** this is a local assignment backend, without authentication, per-user access control, rate limits, automatic retention, certificate signing, or email delivery. UUIDs identify records but are not authorization. Add these controls before exposing recipient data publicly. The recipient cap bounds batch size, but a reverse proxy should enforce a request-byte limit for an Internet-facing deployment. No retry endpoint is included; corrected or intentionally retried entries can be submitted as a new job.
+**Schema setup:** tables are created lazily on the first database route in Vercel, so import/startup does not write to the read-only project directory. PostgreSQL advisory locking serializes initial schema setup. Locally, setup happens at startup. Existing SQLite files use the same tables and columns; PostgreSQL is a separate store and does not automatically import local records.
+
+**Scope:** this assignment backend does not include authentication, per-user access control, rate limits, retention, certificate signing, or email delivery. UUIDs are identifiers, not authorization. Do not submit sensitive recipient data to a public demo. Use access controls and a request-byte limit before an Internet-facing production deployment.
+
+## Vercel deployment and the 500 startup error
+
+The original local-only app could fail during startup because `data/certificates.db` is inside the read-only deployment directory. Local SQLite storage also cannot provide durable shared data across Vercel function instances. Moving it to `/tmp` would not solve persistence.
+
+This version has a root `main.py` entrypoint, a FastAPI framework preset, and PostgreSQL support. `/` redirects to `/docs`. The docs and OpenAPI schema remain available without a configured database. Database endpoints return an actionable **503** until a database is configured; this is a configuration requirement, not a working certificate service yet.
+
+1. In Vercel, open this project and connect an existing PostgreSQL database or provision one through Storage/Marketplace using your chosen provider.
+2. In **Settings → Environment Variables**, set `DATABASE_URL` to the provider's PostgreSQL connection string for Production (and Preview if needed). Use the provider's TLS-enabled URL; preserve SSL query parameters. Never commit or paste database passwords into the repository.
+3. Deploy the latest commit. Use the repository root as Root Directory and FastAPI as Framework Preset. No custom output directory or build command is needed.
+4. Open `/docs`, then `/health`. A configured, reachable database returns `{"status":"ok"}`.
+5. POST the example batch, retrieve its status and list of certificates, then download a PDF.
+
+The schema is created automatically; the database user needs permission to create the application's tables. `DATABASE_URL` accepts `postgres://`, `postgresql://`, or `postgresql+psycopg://` URLs. No in-memory or temporary-filesystem fallback is used on Vercel. If the site still reports `FUNCTION_INVOCATION_FAILED`, check **Vercel → Logs** for the actual import/startup traceback; this code fix cannot diagnose an unrelated platform error without those logs.
 
 ## Optional separate worker process
 
@@ -155,7 +172,7 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-Tests use isolated temporary databases. They cover job creation, envelope and per-recipient validation, PDF contents, progress, partial rendering failure, downloads, pagination, maximum batch size, duplicates, restart recovery, rollback after interruption, multiple workers, and the actual background worker lifecycle. GitHub Actions runs the same suite on push and pull requests.
+Tests use isolated temporary databases. They cover job creation, envelope and per-recipient validation, PDF contents, progress, partial rendering failure, downloads, pagination, maximum batch size, duplicates, restart recovery, rollback after interruption, multiple workers, and the actual background worker lifecycle. GitHub Actions runs the suite with SQLite and repeats the core API tests against a dedicated PostgreSQL 16 service. Set `TEST_DATABASE_URL` only to a disposable database ending in `_test`: those integration tests drop and recreate its application tables.
 
 ## Code walkthrough
 
@@ -163,10 +180,10 @@ Tests use isolated temporary databases. They cover job creation, envelope and pe
 | --- | --- |
 | `app/main.py` | API routes, application lifecycle, submission and retrieval |
 | `app/schemas.py` | Request and recipient validation |
-| `app/db.py` | SQLite schema, connections, transactions |
+| `app/db.py` | SQLAlchemy schema, SQLite/PostgreSQL connections and transactions |
 | `app/worker.py` | Durable polling queue and isolated PDF processing |
 | `app/pdf.py` | Fixed certificate design with bounded text widths |
 | `tests/test_api.py` | API, persistence, worker, and PDF tests |
 | `examples/job.json` | Runnable mixed-success request |
 
-For an interview walkthrough, follow `POST /jobs` → recipient validation → one database transaction → `process_one` → PDF rendering → persisted status/PDF → polling and downloading. The central tradeoff is a simple, crash-safe SQLite transaction per certificate at the cost of serialized generation. A changed requirement for high parallel throughput would call for a different claiming mechanism and external PDF storage.
+For an interview walkthrough, follow `POST /jobs` → recipient validation → one database transaction → `process_one` → PDF rendering → persisted status/PDF → polling and downloading. The key tradeoff is keeping rendering and PDF storage in one transaction. SQLite serializes writes; PostgreSQL uses row locks. Vercel processing stays inside the invocation, while an always-on host can run the polling worker.
