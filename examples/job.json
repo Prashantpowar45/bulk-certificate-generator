@@ -1,0 +1,10 @@
+{
+  "course_name": "Python Backend Development",
+  "organization": "Example Academy",
+  "issue_date": "2026-10-08",
+  "recipients": [
+    {"name": "Alex Morgan", "email": "alex@example.com"},
+    {"name": "Sam Taylor", "email": "sam@example.com"},
+    {"name": "Invalid Recipient", "email": "not-an-email"}
+  ]
+}
